@@ -1,0 +1,12 @@
+doc/
+/build*/
+/managed_components/
+/sdkconfig
+/sdkconfig.old
+/diagnostics/lcd_color/build*/
+/diagnostics/lcd_color/sdkconfig
+/diagnostics/lcd_color/sdkconfig.old
+/.obsidian/
+*.bin
+*.elf
+*.map

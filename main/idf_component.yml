@@ -1,0 +1,3 @@
+# LVGL 9.5.0 已存在于此电脑的 ESP-IDF 离线组件缓存。
+dependencies:
+  lvgl/lvgl: "9.5.0"
