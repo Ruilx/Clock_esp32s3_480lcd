@@ -10,3 +10,6 @@ doc/
 *.bin
 *.elf
 *.map
+/.pio/
+/.vscode/
+/sdkconfig.esp32s3-4b

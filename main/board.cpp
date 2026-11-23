@@ -1,9 +1,11 @@
 #include "board.hpp"
 #include "st7701_4b.hpp"
 
+#include <algorithm>
 #include <cstdint>
 
 #include "driver/gpio.h"
+#include "driver/ledc.h"
 #include "esp_check.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_panel_rgb.h"
@@ -21,6 +23,11 @@ constexpr int kBacklightOn = 0;
 constexpr int kPclkHz = 12000000;
 constexpr int kBounceLines = 20;
 constexpr int kI2cTimeoutMs = 50;
+constexpr uint32_t kLedcDutyMax = 8191;
+constexpr ledc_mode_t kLedcMode = LEDC_LOW_SPEED_MODE;
+constexpr ledc_timer_t kLedcTimer = LEDC_TIMER_0;
+constexpr ledc_channel_t kLedcChannel = LEDC_CHANNEL_0;
+uint32_t s_backlight_percent = 100;
 
 i2c_master_bus_handle_t s_bus = nullptr;
 
@@ -182,11 +189,23 @@ esp_err_t init_lcd(Lcd& lcd)
         return ESP_OK;
     }
 
-    gpio_config_t bl{};
-    bl.pin_bit_mask = 1ULL << kBacklight;
-    bl.mode = GPIO_MODE_OUTPUT;
-    ESP_RETURN_ON_ERROR(gpio_set_level(kBacklight, kBacklightOff), kTag, "set backlight off");
-    ESP_RETURN_ON_ERROR(gpio_config(&bl), kTag, "configure backlight GPIO");
+    ledc_timer_config_t timer{};
+    timer.speed_mode = kLedcMode;
+    timer.timer_num = kLedcTimer;
+    timer.duty_resolution = LEDC_TIMER_13_BIT;
+    timer.freq_hz = 5000;
+    timer.clk_cfg = LEDC_AUTO_CLK;
+    ESP_RETURN_ON_ERROR(ledc_timer_config(&timer), kTag, "configure backlight PWM timer");
+
+    ledc_channel_config_t channel{};
+    channel.speed_mode = kLedcMode;
+    channel.channel = kLedcChannel;
+    channel.timer_sel = kLedcTimer;
+    channel.gpio_num = kBacklight;
+    channel.duty = kLedcDutyMax;
+    channel.hpoint = 0;
+    ESP_RETURN_ON_ERROR(ledc_channel_config(&channel), kTag, "configure backlight PWM");
+    ESP_RETURN_ON_ERROR(ledc_update_duty(kLedcMode, kLedcChannel), kTag, "set backlight off");
 
     i2c_master_bus_config_t i2c{};
     i2c.i2c_port = I2C_NUM_1;
@@ -205,9 +224,13 @@ esp_err_t init_lcd(Lcd& lcd)
     if (err == ESP_OK) err = esp_lcd_panel_reset(panel);
     if (err == ESP_OK) err = esp_lcd_panel_init(panel);
     if (err == ESP_OK) err = esp_lcd_rgb_panel_get_frame_buffer(panel, 1, &framebuffer);
-    if (err == ESP_OK) err = gpio_set_level(kBacklight, kBacklightOn);
+    if (err == ESP_OK) {
+        set_backlight_percent(s_backlight_percent);
+        err = ESP_OK;
+    }
     if (err != ESP_OK) {
-        gpio_set_level(kBacklight, kBacklightOff);
+        ledc_set_duty(kLedcMode, kLedcChannel, kLedcDutyMax);
+        ledc_update_duty(kLedcMode, kLedcChannel);
         if (panel) esp_lcd_panel_del(panel);
         i2c_del_master_bus(bus);
         return err;
@@ -223,6 +246,20 @@ esp_err_t init_lcd(Lcd& lcd)
 i2c_master_bus_handle_t i2c_bus()
 {
     return s_bus;
+}
+
+void set_backlight_percent(uint32_t percent)
+{
+    percent = std::clamp<uint32_t>(percent, 0, 100);
+    s_backlight_percent = percent;
+    const uint32_t duty = kLedcDutyMax - (kLedcDutyMax * percent / 100);
+    ledc_set_duty(kLedcMode, kLedcChannel, duty);
+    ledc_update_duty(kLedcMode, kLedcChannel);
+}
+
+uint32_t backlight_percent()
+{
+    return s_backlight_percent;
 }
 
 }  // namespace board

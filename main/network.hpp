@@ -7,6 +7,8 @@ struct NetworkStatus {
     bool sta_online;
     char ap_ssid[33];
     char setup_key[17]; // 仅交给本机 LCD，不输出到串口或网页。
+    char sta_ssid[33];
+    char sta_ip[16];
 };
 
 void network_init();

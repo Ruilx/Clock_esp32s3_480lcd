@@ -27,7 +27,7 @@ extern "C" void app_main()
         ESP_LOGE("clock", "NVS initialization failed: %s", esp_err_to_name(err));
     }
     clock_ui::init();
-    lv_timer_create([](lv_timer_t *) { clock_ui::refresh(); }, 100, nullptr);
+    lv_timer_create([](lv_timer_t *) { clock_ui::refresh(); }, 1000, nullptr);
     while (true) {
         const uint32_t delay_ms = std::clamp<uint32_t>(lv_timer_handler(), 5, 50);
         vTaskDelay(std::max<TickType_t>(1, pdMS_TO_TICKS(delay_ms)));

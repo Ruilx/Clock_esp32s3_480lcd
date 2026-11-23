@@ -20,4 +20,6 @@ esp_err_t init_lcd(Lcd& lcd);
 // 时钟应用的 LVGL 接入；只有 app_main 调用 lv_timer_handler()。
 esp_err_t init_display();
 i2c_master_bus_handle_t i2c_bus();
+void set_backlight_percent(uint32_t percent);
+uint32_t backlight_percent();
 }
