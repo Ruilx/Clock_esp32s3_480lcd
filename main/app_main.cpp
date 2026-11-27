@@ -8,6 +8,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "lvgl.h"
+#include "host_status.hpp"
 #include "network.hpp"
 #include "nvs_flash.h"
 

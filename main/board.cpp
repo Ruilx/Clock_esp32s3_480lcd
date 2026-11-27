@@ -262,4 +262,9 @@ uint32_t backlight_percent()
     return s_backlight_percent;
 }
 
+uint16_t* framebuffer()
+{
+    return s_lcd.pixels;
+}
+
 }  // namespace board

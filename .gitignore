@@ -11,5 +11,6 @@ doc/
 *.elf
 *.map
 /.pio/
+/tools/host-agent/build*/
 /.vscode/
 /sdkconfig.esp32s3-4b

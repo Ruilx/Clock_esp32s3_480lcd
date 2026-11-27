@@ -1,6 +1,7 @@
 #include "network.hpp"
 #include "board.hpp"
 #include "clock_time.hpp"
+#include "host_status.hpp"
 
 #include <atomic>
 #include <cerrno>
@@ -20,6 +21,7 @@
 #include "freertos/task.h"
 #include "lwip/sockets.h"
 #include "nvs.h"
+#include "esp_heap_caps.h"
 
 namespace {
 constexpr char tag[] = "clock_net";
@@ -152,6 +154,7 @@ void link(bool up)
     }
     portEXIT_CRITICAL(&state_lock);
     if (changed) clock_time::notify_network(up);
+    if (up) host_status::init();
 }
 
 void event(void *, esp_event_base_t base, int32_t id, void *data)
@@ -173,8 +176,8 @@ void event(void *, esp_event_base_t base, int32_t id, void *data)
 
 bool request_ok(httpd_req_t *req)
 {
-    if (portal.load()) return true;
-    ESP_LOGW(tag, "Rejected %s because the setup portal is inactive", req->uri);
+    if (server != nullptr) return true;
+    ESP_LOGW(tag, "Rejected %s because the configuration server is inactive", req->uri);
     return false;
 }
 
@@ -196,9 +199,12 @@ esp_err_t reply_html(httpd_req_t *req, const char *body)
     return httpd_resp_sendstr(req, body);
 }
 
+esp_err_t form(httpd_req_t *req);
+
 esp_err_t captive_redirect(httpd_req_t *req)
 {
     if (!request_ok(req)) return reply(req, "请通过时钟热点访问。", "403 Forbidden");
+    if (!portal.load()) return form(req);
     httpd_resp_set_status(req, "302 Found");
     httpd_resp_set_hdr(req, "Location", "http://192.168.4.1/");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
@@ -208,12 +214,14 @@ esp_err_t captive_redirect(httpd_req_t *req)
 esp_err_t form(httpd_req_t *req)
 {
     if (!request_ok(req)) return reply(req, "请通过时钟热点访问。", "403 Forbidden");
-    char body[2200];
+    char body[3200];
     const int len = std::snprintf(body, sizeof body, R"html(<!doctype html><html lang="zh-CN">
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>时钟设置</title><h1>时钟设置</h1>
 <form method="post" action="/configure"><input name="token" type="hidden" value="%s">
-<p><label>Wi-Fi 名称（留空只改时区） <input name="ssid" maxlength="32"></label></p>
+<p><label>Wi-Fi 名称（留空只改时区） <input name="ssid" id="ssid-input" maxlength="32"></label></p>
+<p><button type="button" id="scan-button" onclick="scanNetworks()">扫描附近 Wi-Fi</button>
+<select id="ssid-list" onchange="document.getElementById('ssid-input').value=this.value"><option value="">选择扫描结果</option></select></p>
 <p><label>Wi-Fi 密码（开放网络留空） <input name="key" type="password" maxlength="64" autocomplete="new-password"></label></p>
 <p><label>UTC 偏移（分钟） <input name="zone" type="number" min="-720" max="840" value="%ld" required></label></p>
 <p><label><input name="dst" type="checkbox" value="1" %s>夏令时（手动加 60 分钟）</label></p>
@@ -224,15 +232,94 @@ oninput="document.getElementById('brightness-value').value=this.value+'%%'"></la
 <form method="post" action="/time" onsubmit="this.elements.utc.value=Math.floor(Date.now()/1000)">
 <input name="token" type="hidden" value="%s"><input name="utc" type="hidden">
 <button>使用本机时间</button>（SNTP 成功前可用）</form>
-<p>无线网络密码仅在本次开机使用；时区设置会保留。</p></html>)html",
+<p>无线网络密码仅在本次开机使用；时区设置会保留。</p>
+<script>
+async function scanNetworks(){
+ const button=document.getElementById('scan-button');
+ const list=document.getElementById('ssid-list');
+ button.disabled=true; button.textContent='正在扫描...';
+ list.innerHTML='<option value="">正在扫描...</option>';
+ try{
+  const response=await fetch('/scan',{cache:'no-store'});
+  if(!response.ok) throw new Error(await response.text());
+  const networks=await response.json();
+  list.innerHTML='<option value="">选择扫描结果</option>';
+  for(const network of networks){
+   const option=document.createElement('option');
+   option.value=network.ssid; option.textContent=network.ssid+' ('+network.rssi+' dBm)';
+   list.appendChild(option);
+  }
+ }catch(error){
+  list.innerHTML='<option value="">扫描失败，请重试</option>';
+ }finally{
+  button.disabled=false; button.textContent='重新扫描';
+ }
+}
+</script></html>)html",
         csrf, static_cast<long>(zone.base), zone.dst ? "checked" : "",
         static_cast<unsigned long>(board::backlight_percent()),
         static_cast<unsigned long>(board::backlight_percent()), csrf);
     if (len < 0 || static_cast<size_t>(len) >= sizeof body) return reply(req, "页面生成失败。", "500 Internal Server Error");
     httpd_resp_set_type(req, "text/html; charset=utf-8");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
-    httpd_resp_set_hdr(req, "Content-Security-Policy", "default-src 'none'; script-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'");
+    httpd_resp_set_hdr(req, "Content-Security-Policy", "default-src 'none'; connect-src 'self'; script-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'");
     return httpd_resp_send(req, body, len);
+}
+
+static void json_escape_ssid(char* output, size_t output_size, const uint8_t* ssid, size_t ssid_size)
+{
+    size_t used = 0;
+    for (size_t i = 0; i < ssid_size && used + 2 < output_size; ++i) {
+        const uint8_t c = ssid[i];
+        if (c == '"' || c == '\\') {
+            if (used + 3 >= output_size) break;
+            output[used++] = '\\';
+            output[used++] = static_cast<char>(c);
+        } else if (c < 0x20) {
+            if (used + 7 >= output_size) break;
+            used += std::snprintf(output + used, output_size - used, "\\u%04x", c);
+        } else {
+            output[used++] = static_cast<char>(c);
+        }
+    }
+    output[used] = 0;
+}
+
+esp_err_t scan_networks(httpd_req_t *req)
+{
+    if (!request_ok(req)) return reply(req, "请通过时钟配网页面访问。", "403 Forbidden");
+    if (esp_wifi_scan_start(nullptr, true) != ESP_OK) {
+        return reply(req, "Wi-Fi 扫描失败，请稍后重试。", "500 Internal Server Error");
+    }
+
+    uint16_t count = 20;
+    wifi_ap_record_t records[20]{};
+    if (esp_wifi_scan_get_ap_records(&count, records) != ESP_OK) {
+        esp_wifi_clear_ap_list();
+        return reply(req, "无法读取扫描结果。", "500 Internal Server Error");
+    }
+
+    char body[4096];
+    size_t used = 0;
+    used += std::snprintf(body + used, sizeof(body) - used, "[");
+    bool first = true;
+    for (uint16_t i = 0; i < count && used < sizeof(body) - 192; ++i) {
+        char ssid[65];
+        json_escape_ssid(ssid, sizeof(ssid), records[i].ssid,
+                         std::strlen(reinterpret_cast<const char*>(records[i].ssid)));
+        if (!ssid[0]) continue;
+        used += std::snprintf(body + used, sizeof(body) - used,
+                              "%s{\"ssid\":\"%s\",\"rssi\":%d,\"auth\":%d}",
+                              first ? "" : ",", ssid, records[i].rssi, static_cast<int>(records[i].authmode));
+        first = false;
+    }
+    used += std::snprintf(body + used, sizeof(body) - used, "]");
+    esp_wifi_clear_ap_list();
+
+    httpd_resp_set_status(req, "200 OK");
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    return httpd_resp_send(req, body, used);
 }
 
 int hex_digit(char c)
@@ -278,6 +365,102 @@ bool number(const char *text, long long lo, long long hi, long long &out)
     errno = 0;
     out = std::strtoll(text, &end, 10);
     return !errno && end != text && !*end && out >= lo && out <= hi;
+}
+
+esp_err_t host_status_json(httpd_req_t *req)
+{
+    if (!request_ok(req)) return reply(req, "请通过时钟配网页面访问。", "403 Forbidden");
+    const auto data = host_status::snapshot();
+    const bool valid = host_status::valid();
+    const int64_t last_us = host_status::last_received_us();
+    char body[512];
+    const int len = std::snprintf(body, sizeof(body),
+        "{\"valid\":%s,\"sequence\":%lu,\"cpu\":%lu,\"memory_used_mb\":%lu,"
+        "\"memory_total_mb\":%lu,\"gpu\":%lu,\"gpu_memory_used_mb\":%lu,"
+        "\"gpu_memory_total_mb\":%lu,\"rx_kbps\":%lu,\"tx_kbps\":%lu,"
+        "\"last_received_us\":%lld}",
+        valid ? "true" : "false",
+        static_cast<unsigned long>(data.sequence),
+        static_cast<unsigned long>(data.cpu_percent),
+        static_cast<unsigned long>(data.memory_used_mb),
+        static_cast<unsigned long>(data.memory_total_mb),
+        static_cast<unsigned long>(data.gpu_percent),
+        static_cast<unsigned long>(data.gpu_memory_used_mb),
+        static_cast<unsigned long>(data.gpu_memory_total_mb),
+        static_cast<unsigned long>(data.network_rx_kbps),
+        static_cast<unsigned long>(data.network_tx_kbps),
+        static_cast<long long>(last_us));
+    if (len < 0 || static_cast<size_t>(len) >= sizeof(body)) {
+        return reply(req, "状态数据生成失败。", "500 Internal Server Error");
+    }
+    httpd_resp_set_status(req, "200 OK");
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    return httpd_resp_send(req, body, len);
+}
+
+esp_err_t snapshot_bmp(httpd_req_t *req)
+{
+    if (!request_ok(req)) return reply(req, "请通过时钟配网页面访问。", "403 Forbidden");
+    uint16_t* pixels = board::framebuffer();
+    if (!pixels) return reply(req, "屏幕帧缓冲不可用。", "500 Internal Server Error");
+
+    constexpr int width = 480;
+    constexpr int height = 480;
+    constexpr size_t row_size = width * 2;
+    constexpr size_t image_size = row_size * height;
+    constexpr size_t header_size = 66;
+    uint8_t header[header_size]{};
+    header[0] = 'B';
+    header[1] = 'M';
+    const uint32_t file_size = static_cast<uint32_t>(header_size + image_size);
+    header[2] = file_size & 0xff;
+    header[3] = (file_size >> 8) & 0xff;
+    header[4] = (file_size >> 16) & 0xff;
+    header[5] = (file_size >> 24) & 0xff;
+    header[10] = 66;
+    header[14] = 40;
+    header[18] = width & 0xff;
+    header[19] = (width >> 8) & 0xff;
+    header[22] = height & 0xff;
+    header[23] = (height >> 8) & 0xff;
+    header[26] = 1;
+    header[28] = 16;
+    header[30] = 3;
+    header[34] = static_cast<uint8_t>(image_size & 0xff);
+    header[35] = static_cast<uint8_t>((image_size >> 8) & 0xff);
+    header[36] = static_cast<uint8_t>((image_size >> 16) & 0xff);
+    header[37] = static_cast<uint8_t>((image_size >> 24) & 0xff);
+    header[54] = 0x00;
+    header[55] = 0xf8;
+    header[58] = 0xe0;
+    header[59] = 0x07;
+    header[62] = 0x1f;
+
+    uint8_t* row = static_cast<uint8_t*>(heap_caps_malloc(row_size, MALLOC_CAP_INTERNAL));
+    if (!row) return reply(req, "截图行缓冲不足。", "500 Internal Server Error");
+
+    httpd_resp_set_status(req, "200 OK");
+    httpd_resp_set_type(req, "image/bmp");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    if (httpd_resp_send_chunk(req, reinterpret_cast<const char*>(header), sizeof(header)) != ESP_OK) {
+        heap_caps_free(row);
+        return ESP_FAIL;
+    }
+    for (int y = height - 1; y >= 0; --y) {
+        for (int x = 0; x < width; ++x) {
+            const uint16_t p = pixels[y * width + x];
+            row[x * 2] = static_cast<uint8_t>(p & 0xff);
+            row[x * 2 + 1] = static_cast<uint8_t>((p >> 8) & 0xff);
+        }
+        if (httpd_resp_send_chunk(req, reinterpret_cast<const char*>(row), row_size) != ESP_OK) {
+            heap_caps_free(row);
+            return ESP_FAIL;
+        }
+    }
+    httpd_resp_send_chunk(req, nullptr, 0);
+    heap_caps_free(row);
+    return ESP_OK;
 }
 
 esp_err_t submit(httpd_req_t *req)
@@ -335,9 +518,9 @@ esp_err_t submit(httpd_req_t *req)
 <h1>时区已保存</h1><p>页面设置已更新。</p></body></html>)html");
 }
 
-bool start_portal()
+bool start_config_server()
 {
-    if (!ok(esp_wifi_set_mode(WIFI_MODE_APSTA)) || !ok(esp_netif_get_netif_impl_name(ap_netif, ap_interface.ifr_name))) return false;
+    if (server != nullptr) return true;
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.stack_size = 8192;
     cfg.max_open_sockets = 3;
@@ -354,6 +537,24 @@ bool start_portal()
     if (result == ESP_OK) {
         uri.uri = "/time";
         uri.method = HTTP_POST;
+        result = httpd_register_uri_handler(server, &uri);
+    }
+    if (result == ESP_OK) {
+        uri.uri = "/scan";
+        uri.method = HTTP_GET;
+        uri.handler = scan_networks;
+        result = httpd_register_uri_handler(server, &uri);
+    }
+    if (result == ESP_OK) {
+        uri.uri = "/host-status";
+        uri.method = HTTP_GET;
+        uri.handler = host_status_json;
+        result = httpd_register_uri_handler(server, &uri);
+    }
+    if (result == ESP_OK) {
+        uri.uri = "/snapshot.bmp";
+        uri.method = HTTP_GET;
+        uri.handler = snapshot_bmp;
         result = httpd_register_uri_handler(server, &uri);
     }
     if (result == ESP_OK) {
@@ -374,6 +575,14 @@ bool start_portal()
     if (!ok(result)) {
         httpd_stop(server); server = nullptr; return false;
     }
+    ESP_LOGI(tag, "Configuration server ready on HTTP port 80");
+    return true;
+}
+
+bool start_portal()
+{
+    if (!ok(esp_wifi_set_mode(WIFI_MODE_APSTA)) || !ok(esp_netif_get_netif_impl_name(ap_netif, ap_interface.ifr_name))) return false;
+    if (!start_config_server()) return false;
     portal.store(true);
     ESP_LOGI(tag, "Setup portal ready; see LCD for access");
     return true;
@@ -486,7 +695,6 @@ void manage(void *)
             if (!start_portal()) { esp_wifi_set_mode(WIFI_MODE_STA); retry_portal = now + 5 * sec; }
         } else if (recent && portal.load() && now - synced >= 15 * sec) {
             portal.store(false);
-            httpd_stop(server); server = nullptr;
             ok(esp_wifi_set_mode(WIFI_MODE_STA));
         }
         vTaskDelay(pdMS_TO_TICKS(500));
@@ -532,6 +740,10 @@ void network_init()
         std::memcpy(identity.sta_ssid, saved_wifi.ssid, sizeof identity.sta_ssid);
         identity.sta_ssid[32] = 0;
         ok(esp_wifi_connect());
+    }
+    start_config_server();
+    if (!host_status::init()) {
+        ESP_LOGE(tag, "Host status UDP service initialization failed");
     }
     changes = xQueueCreate(1, sizeof(Wifi));
     if (!changes || xTaskCreate(manage, "clock_net", 4096, nullptr, 4, nullptr) != pdPASS)
